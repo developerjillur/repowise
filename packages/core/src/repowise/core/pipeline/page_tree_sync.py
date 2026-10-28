@@ -23,11 +23,11 @@ logger = structlog.get_logger(__name__)
 
 
 async def rebuild_page_tree(session: Any, repo_id: str) -> int:
-    """Recompute and store parent, order and section for every page of a repo.
+    """Recompute and store placement and layer metadata for every page of a repo.
 
-    Returns the number of rows whose placement changed. Safe to call after any
-    write to wiki_pages, and cheap enough to call unconditionally: it reads
-    four small columns plus metadata and writes only what moved.
+    Returns the number of rows whose placement or metadata changed. Safe to
+    call after any write to wiki_pages, and cheap enough to call
+    unconditionally: it reads tree fields and metadata and writes only changes.
     """
     from sqlalchemy import select
 
@@ -57,6 +57,7 @@ async def rebuild_page_tree(session: Any, repo_id: str) -> int:
 
     nodes: list[TreeNode] = []
     before: dict[str, tuple[str | None, int, str | None]] = {}
+    metadata_before: dict[str, dict[str, Any]] = {}
     layer_order_ids: list[str] = []
 
     for pid, page_type, target, meta_json, parent, order, section, freshness in rows:
@@ -75,6 +76,7 @@ async def rebuild_page_tree(session: Any, repo_id: str) -> int:
             if isinstance(spine, list):
                 layer_order_ids = [s for s in spine if isinstance(s, str)]
         before[pid] = (parent, order, section)
+        metadata_before[pid] = metadata.copy() if isinstance(metadata, dict) else {}
         nodes.append(
             TreeNode(
                 page_id=pid,
@@ -87,12 +89,17 @@ async def rebuild_page_tree(session: Any, repo_id: str) -> int:
     assign_page_tree(nodes, layer_order_ids)
 
     placed = {n.page_id: (n.parent_page_id, n.display_order, n.section_number) for n in nodes}
+    metadata_updates = {
+        n.page_id: json.dumps(n.metadata)
+        for n in nodes
+        if n.metadata != metadata_before[n.page_id]
+    }
     changed = 0
     for pid, current in before.items():
         # A tombstoned page is not in ``placed``; unplace it rather than
         # leaving whatever it carried from when its file still existed.
         wanted = placed.get(pid, (None, 0, None))
-        if wanted != current:
+        if wanted != current or pid in metadata_updates:
             changed += 1
 
     if not changed:
@@ -105,6 +112,8 @@ async def rebuild_page_tree(session: Any, repo_id: str) -> int:
         page.parent_page_id = parent
         page.display_order = order
         page.section_number = section
+        if page.id in metadata_updates:
+            page.metadata_json = metadata_updates[page.id]
 
     logger.info("page_tree_rebuilt", repo_id=repo_id, pages=len(nodes), changed=changed)
     return changed
