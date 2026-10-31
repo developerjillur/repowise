@@ -57,7 +57,11 @@ from repowise.core.analysis.actions.rules.hygiene import PUBLIC_ENV_KIND, SECRET
 from repowise.core.analysis.dead_code.risk_factors import REVIEW_ONLY_KINDS
 from repowise.core.analysis.dead_code.serving import CrossRepoLookup, is_safe, serve_findings
 from repowise.core.analysis.finding_registry import excluded_types
-from repowise.core.analysis.test_reachability import any_tests_reaching
+from repowise.core.analysis.test_reachability import (
+    any_tests_reaching,
+    test_masks_stored,
+    write_test_masks_snapshot,
+)
 
 from ...models import (
     ActionState,
@@ -77,7 +81,7 @@ from ...models import (
     SecurityFinding,
 )
 from ...read_snapshots import mark_current, read_snapshot, refresh_snapshot, snapshot_key
-from .fix_first import load_fix_first, write_fix_first_snapshot
+from .fix_first import fix_first_stored, load_fix_first, write_fix_first_snapshot
 
 logger = logging.getLogger(__name__)
 
@@ -601,11 +605,24 @@ async def write_actions_snapshot(session: AsyncSession, repo_id: str) -> bool:
     )
 
 
+async def write_actions_view(session: AsyncSession, repo_id: str) -> bool:
+    """Store the actions view again after a write that drops only it (a decision).
+
+    Skipped unless the queue and test masks it reads are stored: building them
+    here would hand a decision write the whole index-time build. Returns
+    whether it wrote.
+    """
+    if not (await fix_first_stored(session, repo_id) and await test_masks_stored(session, repo_id)):
+        return False
+    return await write_actions_snapshot(session, repo_id)
+
+
 async def write_read_snapshots(
     session: AsyncSession, repo_id: str
 ) -> list[tuple[str, Exception]]:
     """Store the Fix first queue, then the actions view that quotes its head,
-    then the run's component snapshot (:mod:`repowise.core.events`).
+    then the test masks that view's build read, then the run's component
+    snapshot (:mod:`repowise.core.events`).
 
     For a writer whose stores are final for this run, on the session that
     wrote them or a later one. Best-effort, each in its own savepoint: a view
@@ -617,6 +634,7 @@ async def write_read_snapshots(
     for kind, write in (
         ("fix_first", write_fix_first_snapshot),
         (SNAPSHOT_KIND, write_actions_snapshot),
+        ("test_masks", write_test_masks_snapshot),
     ):
         try:
             async with session.begin_nested():

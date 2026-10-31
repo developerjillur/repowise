@@ -816,8 +816,11 @@ def _header_text(text: str | bytes | None) -> str:
     if isinstance(text, bytes):
         # Twenty lines of a hand-written file fit in 4 KB; a minified bundle
         # has no newlines, and its first 4 KB says as much as the rest.
-        return text[:4096].decode("utf-8", errors="ignore")
-    return text[:4096]
+        text = text[:4096].decode("utf-8", errors="ignore")
+    head = text[:4096]
+    # Binary content (a zipped .pptx, a PDF stream) has no banner and is no
+    # bundle; read as text it looks like one long minified line.
+    return "" if "\x00" in head else head
 
 
 def _split(path: str) -> tuple[str, str, list[str]] | None:
@@ -1035,6 +1038,15 @@ def path_origin(path: str) -> CodeOrigin:
     the stored ``code_origin`` reads that instead: it also saw the file's head.
     """
     return code_origin(path)
+
+
+def prefer_production(paths: list[str]) -> list[str]:
+    """The *paths* whose code ships, in order, or all of them when none does.
+
+    A test helper, a vendored copy or a docs tutorial that defines a production
+    name is not where that name is defined, once production code defines it too.
+    """
+    return [p for p in paths if path_origin(p) == "production"] or list(paths)
 
 
 def ship_rank(path: str) -> int:

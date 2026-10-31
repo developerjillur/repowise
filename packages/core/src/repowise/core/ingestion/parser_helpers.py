@@ -57,6 +57,7 @@ from .lang_helpers.type_heads import (
     _rust_head_type_identifier,
     _rust_shadowed_by_type_param,
 )
+from .models import CSHARP_INTEGER_CONSTANT
 from .type_names import kotlin_extension_receiver
 
 log = structlog.get_logger(__name__)
@@ -273,6 +274,18 @@ def import_load_kind(stmt_node: Node, language: str, src: str) -> tuple[bool, bo
     return False, deferred
 
 
+def _has_missing_scope_separator(qualified: Node) -> bool:
+    """Is the ``::`` in this ``qualified_identifier`` a tree-sitter repair node?
+
+    When an unexpanded macro precedes a return type on the next line,
+    tree-sitter-cpp reads ``MACRO ReturnType name(...)`` as a declaration and
+    repairs it with a zero-width ``(MISSING "::")``, folding the return type
+    into a ``qualified_identifier`` scope. A real ``Foo::bar`` definition has
+    a ``::`` child with source text, so only the repaired shape trips this.
+    """
+    return any(child.type == "::" and child.is_missing for child in qualified.children)
+
+
 def _qualified_cpp_parent(name_node: Node, src: str) -> str | None:
     """Return the parent class for a C/C++ ``Class::method`` definition.
 
@@ -293,6 +306,15 @@ def _qualified_cpp_parent(name_node: Node, src: str) -> str | None:
         return None
     scope = parent.child_by_field_name("scope")
     if scope is None:
+        return None
+    # tree-sitter-cpp repairs an unexpanded macro plus a return type on the
+    # following line into a qualified_identifier by inserting a zero-width
+    # ``(MISSING "::")`` node, so ``LIB_ALWAYS_INLINE box_contents_t`` +
+    # ``box_decode(...)`` reads as a declaration and the free function's
+    # return type is mistaken for the enclosing scope. A genuine
+    # ``Foo::bar`` definition carries a real ``::`` child, so skipping the
+    # missing one keeps out-of-line members classified correctly.
+    if _has_missing_scope_separator(parent):
         return None
     if scope.type == "template_type":
         return cpp_template_type_name(scope, src)
@@ -453,11 +475,13 @@ _APEX_LITERAL_TYPES = {
 
 
 def _overload_arguments(language: str, arg_nodes: list[Node]) -> list[Node]:
-    """A call's argument expressions, for a language whose overloads read them (Java, Apex).
+    """A call's argument expressions, for a language whose overloads read them (Java, Apex, Kotlin).
 
     Read from the argument list already in hand, the way ``_count_arguments``
     counts it.
     """
+    if language == "kotlin":
+        return _kotlin_positional_arguments(arg_nodes)
     if language not in ("java", "apex", "csharp") or not arg_nodes:
         return []
     skip_types = frozenset({"(", ")", ","})
@@ -472,6 +496,69 @@ def _overload_arguments(language: str, arg_nodes: list[Node]) -> list[Node]:
     return arguments
 
 
+def _kotlin_positional_arguments(arg_nodes: list[Node]) -> list[Node]:
+    """Each Kotlin argument's expression, in order, or none at all.
+
+    A named or spread argument, or a trailing lambda, takes a parameter its
+    position does not say, so such a call is not read.
+    """
+    arguments = arg_nodes[0] if arg_nodes else None
+    if arguments is None or arguments.type != "value_arguments" or _kotlin_trailing_lambda(arguments):
+        return []
+    found = []
+    for argument in arguments.named_children:
+        if argument.type != "value_argument":
+            continue
+        parts = argument.named_children
+        if len(parts) != 1 or parts[0].type == "spread_expression":
+            return []
+        found.append(parts[0])
+    return found
+
+
+# Kotlin literals whose type no expected type changes; an unsuffixed integer
+# is an ``Int`` only where an ``Int`` overload exists, which is the one asked.
+_KOTLIN_LITERAL_TYPES = {"string_literal": "String", "character_literal": "Char"}
+_KOTLIN_BOOLEANS = frozenset({"true", "false"})
+# Kotlin's grammar reads these keywords as identifiers; they name no variable.
+_NOT_NAMES = frozenset({b"true", b"false", b"null", b"this"})
+
+
+def _kotlin_literal_type(node: Node, src: str) -> str | None:
+    text = node_text(node, src)
+    if node.type == "identifier":
+        return "Boolean" if text in _KOTLIN_BOOLEANS else None
+    if node.type != "number_literal":
+        return _KOTLIN_LITERAL_TYPES.get(node.type)
+    return _kotlin_number_type(text.lower().replace("_", ""))
+
+
+def _kotlin_number_type(lowered: str) -> str | None:
+    """``Long``, ``Int``, ``Float`` or ``Double`` for a lowercased number.
+
+    None when unsigned, and for an unsuffixed integer past ``Int``'s range,
+    which Kotlin types as a ``Long`` only where no ``Int`` is expected.
+    """
+    if lowered.endswith(("u", "ul")):
+        return None
+    if lowered.endswith("l"):
+        return "Long"
+    base = {"0x": 16, "0b": 2}.get(lowered[:2], 10)
+    if base == 10 and (fraction := _kotlin_fraction_type(lowered)) is not None:
+        return fraction
+    try:
+        value = int(lowered[2:] if base != 10 else lowered, base)
+    except ValueError:
+        return None
+    return "Int" if value < 2**31 else None
+
+
+def _kotlin_fraction_type(lowered: str) -> str | None:
+    if lowered.endswith("f"):
+        return "Float"
+    return "Double" if "." in lowered or "e" in lowered else None
+
+
 def _argument_literal_types(
     arguments: list[Node], src: str, language: str = "java"
 ) -> tuple[str | None, ...] | None:
@@ -480,9 +567,11 @@ def _argument_literal_types(
     None overall when no argument is a literal. C# reports a lambda's and a
     construction's shape instead (``_csharp_argument_shape``).
     """
-    literal_type = {"apex": _apex_literal_type, "csharp": _csharp_argument_shape}.get(
-        language, _java_literal_type
-    )
+    literal_type = {
+        "apex": _apex_literal_type,
+        "csharp": _csharp_argument_shape,
+        "kotlin": _kotlin_literal_type,
+    }.get(language, _java_literal_type)
     types = tuple(literal_type(argument, src) for argument in arguments)
     return types if any(types) else None
 
@@ -503,7 +592,30 @@ def _csharp_argument_shape(node: Node, src: str) -> str | None:
             created = created.named_children[0] if created.named_children else None
         if created is not None and created.type == "identifier":
             return f"new {node_text(created, src)}"
-    return None
+    return _csharp_literal_type(node, src)
+
+
+# C# literal nodes whose type no target type changes.
+_CSHARP_LITERAL_TYPES = {
+    "string_literal": "string",
+    "verbatim_string_literal": "string",
+    "raw_string_literal": "string",
+    "interpolated_string_expression": "string",
+    "character_literal": "char",
+    "boolean_literal": "bool",
+}
+# Integer suffixes whose constant reaches exactly what a value of the type does.
+# An ``L`` constant is left untyped: when non-negative it also reaches ``ulong``.
+_CSHARP_INTEGER_SUFFIXES = {"": CSHARP_INTEGER_CONSTANT, "u": "uint", "ul": "ulong", "lu": "ulong"}
+
+
+def _csharp_literal_type(node: Node, src: str) -> str | None:
+    if node.type == "integer_literal":
+        suffix = node_text(node, src).lower().lstrip("0123456789abcdefx_")
+        return _CSHARP_INTEGER_SUFFIXES.get(suffix)
+    if node.type == "real_literal":
+        return {"f": "float", "m": "decimal"}.get(node_text(node, src)[-1:].lower(), "double")
+    return _CSHARP_LITERAL_TYPES.get(node.type)
 
 
 def _argument_names(arguments: list[Node], src: str) -> tuple[str | None, ...] | None:
@@ -511,7 +623,10 @@ def _argument_names(arguments: list[Node], src: str) -> tuple[str | None, ...] |
 
     None overall when no argument is one. The resolver reads their declared types.
     """
-    names = tuple(node_text(a, src) if a.type == "identifier" else None for a in arguments)
+    names = tuple(
+        node_text(a, src) if a.type == "identifier" and a.text not in _NOT_NAMES else None
+        for a in arguments
+    )
     return names if any(names) else None
 
 
